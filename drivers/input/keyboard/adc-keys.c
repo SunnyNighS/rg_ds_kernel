@@ -173,8 +173,16 @@ static int adc_keys_probe(struct platform_device *pdev)
 		return error;
 	}
 
-	if (!device_property_read_u32(dev, "poll-interval", &value))
+	if (!device_property_read_u32(dev, "poll-interval", &value)) {
+		/*
+		 * RG DS Plus: the DT polls the Home/Back key every 100 ms, which
+		 * drops taps shorter than one period and lags every edge by up to
+		 * 100 ms. Poll it at 20 ms there.
+		 */
+		if (of_machine_is_compatible("anbernic,rg-ds-plus") && value > 20)
+			value = 20;
 		input_set_poll_interval(input, value);
+	}
 
 	error = input_register_device(input);
 	if (error) {
