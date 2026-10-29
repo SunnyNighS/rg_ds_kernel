@@ -477,9 +477,22 @@ static const struct power_supply_desc rk817_usb_desc = {
 	.get_property	= rk817_charge_usb_get_property,
 };
 
+/*
+ * The cw2015 fuel gauge decides between its charge and discharge SoC filters
+ * with power_supply_am_i_supplied(). Name it as our supplicant so that call
+ * sees the ac/usb ONLINE state instead of failing with -ENODEV.
+ */
+static char *rk817_charger_supplied_to[] = {
+	"cw2015-battery",
+};
+
 static int rk817_charge_init_power_supply(struct rk817_charger *charge)
 {
-	struct power_supply_config psy_cfg = { .drv_data = charge, };
+	struct power_supply_config psy_cfg = {
+		.drv_data = charge,
+		.supplied_to = rk817_charger_supplied_to,
+		.num_supplicants = ARRAY_SIZE(rk817_charger_supplied_to),
+	};
 
 	charge->usb_psy = devm_power_supply_register(charge->dev,
 						     &rk817_usb_desc,
