@@ -15,10 +15,12 @@
 #include <linux/gpio/consumer.h>
 #include <linux/iio/consumer.h>
 #include <linux/iio/iio.h>
+#include <linux/init.h>
 #include <linux/irq.h>
 #include <linux/jiffies.h>
 #include <linux/mfd/rk808.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/of_gpio.h>
 #include <linux/platform_device.h>
@@ -27,6 +29,7 @@
 #include <linux/regmap.h>
 #include <linux/rk_keys.h>
 #include <linux/rtc.h>
+#include <linux/string.h>
 #include <linux/timer.h>
 #include <linux/wakelock.h>
 #include <linux/workqueue.h>
@@ -2642,20 +2645,33 @@ static int rk817_battery_time_to_full(struct rk817_battery_device *battery)
  * (gpiochip0 has base 0 on RK3566, verified against the running device's
  * /sys/kernel/debug/gpio).  gpiod_set_raw_value() acts on the bare
  * descriptor because the gpio-leds driver already owns the lines.
+ *
+ * The RG DS Plus (RK3568) wires the same three LEDs differently: green
+ * (DT node work-led, default-state "on") is the power LED, and red sits on
+ * GPIO3_B6 (global 110); GPIO0 line 22 is the touch controller's interrupt
+ * line there.  It follows the Nintendo DS: green while the console is on,
+ * standby included; red in place of green while the battery is low and not
+ * charging; yellow while charging until the gauge reads full.  In charger
+ * mode (powered off, charging) only yellow is lit.
  */
 #define RGDS_LED_GREEN_GPIO	20	/* battery_full     */
 #define RGDS_LED_YELLOW_GPIO	21	/* battery_charging */
 #define RGDS_LED_RED_GPIO	22	/* low_power        */
+#define RGDS_PLUS_LED_RED_GPIO	110	/* low_power, GPIO3_B6 */
 #define RGDS_LED_FULL_SOC	90
+#define RGDS_PLUS_LED_FULL_SOC	100
 #define RGDS_LED_LOW_SOC	20
 
-static int rgds_led_soc;
+static int rgds_led_soc = -1;		/* -1: gauge not read yet */
 static int rgds_led_charger;
 static int rgds_led_ready;
 static int rgds_led_factory;
 static int rgds_led_red_state;
 static int rgds_led_green_state;
 static int rgds_led_yellow_state;
+static unsigned int rgds_led_red_gpio = RGDS_LED_RED_GPIO;
+static bool rgds_led_power_led;		/* RG DS Plus: green is the power LED */
+static bool rgds_led_charger_mode;	/* androidboot.mode=charger */
 
 static void rgds_led_gpio_set(unsigned int gpio, int on)
 {
@@ -2667,7 +2683,7 @@ static void rgds_led_gpio_set(unsigned int gpio, int on)
 
 void led_red_on(int on)
 {
-	rgds_led_gpio_set(RGDS_LED_RED_GPIO, on);
+	rgds_led_gpio_set(rgds_led_red_gpio, on);
 	rgds_led_red_state = on;
 }
 EXPORT_SYMBOL(led_red_on);
@@ -2696,6 +2712,15 @@ void led_update_charger_soc_status(void)
 
 	if (rgds_led_factory)
 		return;
+
+	if (rgds_led_power_led) {
+		bool low = !charger && soc >= 0 && soc < RGDS_LED_LOW_SOC;
+
+		led_green_on(!low && !rgds_led_charger_mode);
+		led_red_on(low);
+		led_yellow_on(charger && soc < RGDS_PLUS_LED_FULL_SOC);
+		return;
+	}
 
 	if (charger) {
 		led_red_on(0);
@@ -3589,6 +3614,15 @@ static int rk817_battery_probe(struct platform_device *pdev)
 	DBG("%x\n", rk817_bat_field_read(battery, CHIP_NAME_L));
 	BAT_INFO("driver version %s\n", DRIVER_VERSION);
 
+	if (of_machine_is_compatible("anbernic,rg-ds-plus")) {
+		rgds_led_power_led = true;
+		rgds_led_red_gpio = RGDS_PLUS_LED_RED_GPIO;
+	}
+#ifndef MODULE
+	rgds_led_charger_mode = strstr(saved_command_line,
+				       "androidboot.mode=charger") != NULL;
+#endif
+
 	/* status LEDs are safe to drive once the gauge is up */
 	rgds_led_ready = 1;
 
@@ -3865,9 +3899,31 @@ static int rk817_bat_pm_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(rk817_bat_pm_ops,
-				rk817_bat_pm_suspend,
-				rk817_bat_pm_resume);
+/*
+ * gpio-leds zeroes LEDs without retain-state-suspended in its class suspend
+ * and restores their stale class brightness on resume, behind the raw GPIO
+ * writes above.  suspend_late runs after every device's suspend callback and
+ * complete after every device's resume callback, so re-assert the policy
+ * there: the RG DS Plus power LED stays lit through standby.
+ */
+static int rk817_bat_pm_suspend_late(struct device *dev)
+{
+	if (rgds_led_ready && rgds_led_power_led)
+		led_update_charger_soc_status();
+	return 0;
+}
+
+static void rk817_bat_pm_complete(struct device *dev)
+{
+	if (rgds_led_ready && rgds_led_power_led)
+		led_update_charger_soc_status();
+}
+
+static const struct dev_pm_ops rk817_bat_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(rk817_bat_pm_suspend, rk817_bat_pm_resume)
+	LATE_SYSTEM_SLEEP_PM_OPS(rk817_bat_pm_suspend_late, NULL)
+	.complete = pm_sleep_ptr(rk817_bat_pm_complete),
+};
 
 static struct platform_driver rk817_battery_driver = {
 	.probe = rk817_battery_probe,
