@@ -23,6 +23,7 @@
 #include <linux/property.h>
 #include <linux/of_gpio.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 
 /*----------------------------------------------------------------------------*/
 #define DRV_NAME "retrogame_joypad"
@@ -84,6 +85,11 @@ static int joy_rail_margin = 8000;
  */
 #define	JOY_HIST_MAX		31
 static int joy_median_win = 21;
+/*
+ * joy_median_win was tuned on the RG DS at DT poll-interval 2 ms, which the
+ * input poller rounds to whole jiffies; scale the window to keep that time span.
+ */
+#define	JOY_MEDIAN_REF_POLL_MS	2
 static int joy_median_railed = 1;
 /*
  * ABS fuzz floor for the analog stick axes, in gained report units.
@@ -881,6 +887,20 @@ static void joypad_adc_check(struct joypad *joypad)
 		struct bt_adc *adc = &joypad->adcs[nbtn];
 		int win = joy_median_win;
 		bool use_median = (win >= 3);
+		unsigned int ref_ms = jiffies_to_msecs(msecs_to_jiffies(JOY_MEDIAN_REF_POLL_MS));
+		unsigned int per_ms = jiffies_to_msecs(msecs_to_jiffies(joypad->poll_interval));
+
+		/*
+		 * Keep the median's time span, not its sample count: at a slower
+		 * poll (RG DS Plus: 10 ms -> 12 ms) 21 samples would be a 252 ms
+		 * window with ~125 ms of lag.
+		 */
+		if (use_median && per_ms > ref_ms) {
+			win = DIV_ROUND_CLOSEST(joy_median_win * (int)ref_ms, (int)per_ms);
+			if (win < 3)
+				win = 3;
+			win |= 1;
+		}
 
 		if (use_median && joy_median_railed && (nbtn ^ 1) < nstick) {
 			int praw = rawnow[nbtn ^ 1];
