@@ -2182,7 +2182,6 @@ static s8 gtp_request_input_dev(struct i2c_client *client,
                                 struct goodix_ts_data *ts)
 {
     s8 ret = -1;
-    s8 phys[32];
 #if GTP_HAVE_TOUCH_KEY
     u8 index = 0;
 #endif
@@ -2227,7 +2226,6 @@ static s8 gtp_request_input_dev(struct i2c_client *client,
     input_set_abs_params(ts->input_dev, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
     input_set_abs_params(ts->input_dev, ABS_MT_TRACKING_ID, 0, 255, 0, 0);
 
-    sprintf(phys, "input/ts");
     /*
      * Name the input device after its DT node ("gt9xx-0" / "gt9xx-1") to match
      * the stock kernel.  The RG DS has two touch controllers, one per screen;
@@ -2246,7 +2244,13 @@ static s8 gtp_request_input_dev(struct i2c_client *client,
     if (client->dev.of_node && client->dev.of_node->name &&
         !strcmp(client->dev.of_node->name, "gt9xx-1"))
         ts->flip_180 = true;
-    ts->input_dev->phys = phys;
+    /*
+     * phys must outlive probe.  It was a stack buffer, so sysfs, /proc and
+     * EVIOCGPHYS read dead stack (leaking kernel pointers).  devm ties it to
+     * the client.  Leave it NULL on failure, which the input core allows.
+     */
+    ts->input_dev->phys = devm_kasprintf(&client->dev, GFP_KERNEL, "%s/input0",
+                                         dev_name(&client->dev));
     ts->input_dev->id.bustype = BUS_I2C;
     ts->input_dev->id.vendor = 0xDEAD;
     ts->input_dev->id.product = 0xBEEF;
