@@ -171,6 +171,7 @@ struct aw883xx {
 	struct delayed_work monitor_work;
 	struct delayed_work interrupt_work;
 	struct delayed_work acf_work;
+	struct work_struct stop_work;
 
 	uint8_t reg_addr;
 	uint16_t dsp_addr;

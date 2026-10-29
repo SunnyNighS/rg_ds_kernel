@@ -737,6 +737,24 @@ static void aw883xx_start(struct aw883xx *aw883xx, bool sync_start)
 	}
 }
 
+/*
+ * The CPU DAI has already stopped BCLK/LRCK when ASoC mutes us in
+ * hw_free, so aw_device_stop() always sees CLKI/PLLI in SYSINT and
+ * reloads the DSP firmware and config (~300 ms per amp on the 200 kHz
+ * bus). Run that stop here, off the PCM close path, so audio HAL
+ * standby does not block for ~0.6 s.
+ */
+static void aw883xx_stop_work(struct work_struct *work)
+{
+	struct aw883xx *aw883xx =
+		container_of(work, struct aw883xx, stop_work);
+
+	mutex_lock(&aw883xx->lock);
+	if (aw883xx->pstream == AW883XX_STREAM_CLOSE)
+		aw_device_stop(aw883xx->aw_pa);
+	mutex_unlock(&aw883xx->lock);
+}
+
 static int aw883xx_mute(struct snd_soc_dai *dai, int mute, int stream)
 {
 	aw_snd_soc_codec_t *codec = aw883xx_get_codec(dai);
@@ -754,9 +772,14 @@ static int aw883xx_mute(struct snd_soc_dai *dai, int mute, int stream)
 		aw883xx->pstream = AW883XX_STREAM_CLOSE;
 		cancel_delayed_work_sync(&aw883xx->start_work);
 		mutex_lock(&aw883xx->lock);
-		aw_device_stop(aw883xx->aw_pa);
+		if (aw883xx->aw_pa->status == AW_DEV_PW_ON) {
+			aw_monitor_stop(&aw883xx->aw_pa->monitor_desc);
+			aw_dev_mute(aw883xx->aw_pa, true);
+		}
 		mutex_unlock(&aw883xx->lock);
+		queue_work(aw883xx->work_queue, &aw883xx->stop_work);
 	} else {
+		flush_work(&aw883xx->stop_work);
 		aw883xx->pstream = AW883XX_STREAM_OPEN;
 		mutex_lock(&aw883xx->lock);
 		aw883xx_start(aw883xx, AW_ASYNC_START);
@@ -1005,6 +1028,8 @@ static int aw883xx_profile_set(struct snd_kcontrol *kcontrol,
 		return 0;
 	}
 
+	flush_work(&aw883xx->stop_work);
+
 	/* check value valid */
 	ret = aw_dev_check_profile_index(aw883xx->aw_pa, ucontrol->value.integer.value[0]);
 	if (ret) {
@@ -1083,6 +1108,8 @@ static int aw883xx_switch_set(struct snd_kcontrol *kcontrol,
 		aw_dev_info(aw883xx->dev, "PA switch not change");
 		return 0;
 	}
+
+	flush_work(&aw883xx->stop_work);
 
 	if (aw883xx->pstream) {
 		if (ucontrol->value.integer.value[0] == 0) {
@@ -1445,6 +1472,7 @@ static int aw883xx_codec_probe(aw_snd_soc_codec_t *aw_codec)
 	INIT_DELAYED_WORK(&aw883xx->interrupt_work, aw883xx_interrupt_work);
 	INIT_DELAYED_WORK(&aw883xx->start_work, aw883xx_startup_work);
 	INIT_DELAYED_WORK(&aw883xx->acf_work, aw883xx_fw_wrok);
+	INIT_WORK(&aw883xx->stop_work, aw883xx_stop_work);
 
 	aw883xx->codec = aw_codec;
 
@@ -1469,6 +1497,7 @@ static void aw883xx_codec_remove(aw_snd_soc_codec_t *aw_codec)
 	cancel_delayed_work_sync(&aw883xx->acf_work);
 	cancel_delayed_work_sync(&aw883xx->aw_pa->monitor_desc.delay_work);
 	cancel_delayed_work_sync(&aw883xx->start_work);
+	cancel_work_sync(&aw883xx->stop_work);
 
 	if (aw883xx->work_queue)
 		destroy_workqueue(aw883xx->work_queue);
@@ -1487,6 +1516,7 @@ static int aw883xx_codec_remove(aw_snd_soc_codec_t *aw_codec)
 	cancel_delayed_work_sync(&aw883xx->acf_work);
 	cancel_delayed_work_sync(&aw883xx->aw_pa->monitor_desc.delay_work);
 	cancel_delayed_work_sync(&aw883xx->start_work);
+	cancel_work_sync(&aw883xx->stop_work);
 
 	if (aw883xx->work_queue)
 		destroy_workqueue(aw883xx->work_queue);
@@ -1497,15 +1527,30 @@ static int aw883xx_codec_remove(aw_snd_soc_codec_t *aw_codec)
 }
 #endif
 
+/*
+ * ASoC mutes the DAIs before it calls this, and the I2C adapter only
+ * suspends later in the noirq phase, so finish a pending stop here.
+ */
+static int aw883xx_codec_suspend(aw_snd_soc_codec_t *aw_codec)
+{
+	struct aw883xx *aw883xx =
+		aw_componet_codec_ops.codec_get_drvdata(aw_codec);
+
+	flush_work(&aw883xx->stop_work);
+	return 0;
+}
+
 #ifdef AW_KERNEL_VER_OVER_4_19_1
 static struct snd_soc_component_driver soc_codec_dev_aw883xx = {
 	.probe = aw883xx_codec_probe,
 	.remove = aw883xx_codec_remove,
+	.suspend = aw883xx_codec_suspend,
 };
 #else
 static struct snd_soc_codec_driver soc_codec_dev_aw883xx = {
 	.probe = aw883xx_codec_probe,
 	.remove = aw883xx_codec_remove,
+	.suspend = aw883xx_codec_suspend,
 };
 #endif
 
