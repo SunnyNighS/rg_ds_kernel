@@ -177,10 +177,12 @@ static int adc_keys_probe(struct platform_device *pdev)
 		/*
 		 * RG DS Plus: the DT polls the Home/Back key every 100 ms, which
 		 * drops taps shorter than one period and lags every edge by up to
-		 * 100 ms. Poll it at 20 ms there.
+		 * 100 ms. Poll it every 20 ms there: 16 ms is 4 jiffies
+		 * (HZ=250), and the timer wheel adds one, so the poller runs
+		 * every 5 jiffies = 20 ms.
 		 */
-		if (of_machine_is_compatible("anbernic,rg-ds-plus") && value > 20)
-			value = 20;
+		if (of_machine_is_compatible("anbernic,rg-ds-plus") && value > 16)
+			value = 16;
 		input_set_poll_interval(input, value);
 	}
 
