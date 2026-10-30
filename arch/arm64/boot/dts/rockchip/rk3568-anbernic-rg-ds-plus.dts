@@ -153,7 +153,11 @@
 		abs_rx-n-tuning = <180>;
 		abs_ry-p-tuning = <180>;
 		abs_ry-n-tuning = <180>;
-		poll-interval = <10>;
+		/* The input poller schedules whole jiffies and the timer wheel adds
+		 * one (HZ=250): 10 ms was really polled every 16 ms (62.5 Hz).
+		 * 4 ms = 1 + 1 jiffies = 8 ms (125 Hz), the rate the RG DS
+		 * (poll-interval 2) runs the same driver at. */
+		poll-interval = <4>;
 
 		/* D-pad reported as HAT (EV_ABS) */
 		sw1  { gpios = <&gpio2 RK_PD4 GPIO_ACTIVE_LOW>; label = "GPIO DPAD-UP";

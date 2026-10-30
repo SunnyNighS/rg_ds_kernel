@@ -892,8 +892,8 @@ static void joypad_adc_check(struct joypad *joypad)
 
 		/*
 		 * Keep the median's time span, not its sample count: at a slower
-		 * poll (RG DS Plus: 10 ms -> 12 ms) 21 samples would be a 252 ms
-		 * window with ~125 ms of lag.
+		 * poll (e.g. 10 ms, which the poller runs every 16 ms) 21 samples
+		 * would be a 336 ms window with ~170 ms of lag.
 		 */
 		if (use_median && per_ms > ref_ms) {
 			win = DIV_ROUND_CLOSEST(joy_median_win * (int)ref_ms, (int)per_ms);
