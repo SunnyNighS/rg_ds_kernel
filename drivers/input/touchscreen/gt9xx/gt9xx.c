@@ -2141,6 +2141,20 @@ static int goodix_ts_early_resume(struct tp_device *tp_d)
 	return 0;
 }
 
+/* The wake takes ~70 ms (INT sync, config write). PANEL_ENABLED is raised
+ * from drm_panel_enable() inside the atomic commit, so doing it there held
+ * the commit (and the second panel's enable) for that long. The panel is
+ * already lit when this runs, so the baseline still matches the lit panel. */
+static void gtp_panel_on_work(struct work_struct *work)
+{
+    struct goodix_ts_data *ts = container_of(work, struct goodix_ts_data, panel_on_work);
+
+    mutex_lock(&ts->tp.ops_lock);
+    if (ts->tp.status == FB_BLANK_UNBLANK)
+        goodix_ts_early_resume(&ts->tp);
+    mutex_unlock(&ts->tp.ops_lock);
+}
+
 /* RG DS: the DRM panel driver tells us when the panel is about to go dark
  * and when it is lit again. The controller sleeps across the dark period
  * (its baseline is frozen, nothing polls a suspended bus) and wakes only once
@@ -2154,18 +2168,23 @@ static int gtp_panel_notifier_call(struct notifier_block *nb, unsigned long val,
     if (!ts->panel_ready)
         return NOTIFY_DONE;
 
-    mutex_lock(&ts->tp.ops_lock);
     if (event == PANEL_PRE_DISABLE)
     {
+        /* A wake still queued is dropped, one running finishes first;
+         * not under ops_lock, which the wake work takes. */
+        cancel_work_sync(&ts->panel_on_work);
+        mutex_lock(&ts->tp.ops_lock);
         ts->tp.status = FB_BLANK_POWERDOWN;
         goodix_ts_early_suspend(&ts->tp);
+        mutex_unlock(&ts->tp.ops_lock);
     }
     else if (event == PANEL_ENABLED)
     {
+        mutex_lock(&ts->tp.ops_lock);
         ts->tp.status = FB_BLANK_UNBLANK;
-        goodix_ts_early_resume(&ts->tp);
+        mutex_unlock(&ts->tp.ops_lock);
+        queue_work(goodix_wq, &ts->panel_on_work);
     }
-    mutex_unlock(&ts->tp.ops_lock);
     return NOTIFY_OK;
 }
 
@@ -2792,6 +2811,7 @@ static int goodix_ts_probe(struct i2c_client *client, const struct i2c_device_id
     /* RG DS: bind to the panel's notifier first. The panel may not have
      * registered yet at this point of boot, in which case we come back later
      * rather than run without it (the controller would then never sleep). */
+    INIT_WORK(&ts->panel_on_work, gtp_panel_on_work);
     ts->panel_nb.notifier_call = gtp_panel_notifier_call;
     ret = devm_rockchip_panel_notifier_register_client(&client->dev, &ts->panel_nb);
     if (ret == -EPROBE_DEFER) {
@@ -3049,6 +3069,12 @@ static void goodix_ts_remove(struct i2c_client *client)
 {
     struct goodix_ts_data *ts = i2c_get_clientdata(client);
     
+    /* No panel event may queue the wake once we are tearing down; unregistering
+     * also waits for a callback still running. */
+    ts->panel_ready = false;
+    if (ts->panel_notifier)
+        devm_rockchip_panel_notifier_unregister_client(&client->dev);
+    cancel_work_sync(&ts->panel_on_work);
     tp_unregister_fb(&ts->tp);
 
     GTP_DEBUG_FUNC();

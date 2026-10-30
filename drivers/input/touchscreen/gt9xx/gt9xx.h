@@ -140,6 +140,8 @@ struct goodix_ts_data {
     struct notifier_block panel_nb;
     bool panel_notifier;
     bool panel_ready;
+    /* Wakes the controller off the DRM commit path (see gtp_panel_on_work). */
+    struct work_struct panel_on_work;
 
     //add by Daniel(yc)
     int irq;
