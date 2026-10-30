@@ -2107,6 +2107,21 @@ static void vop2_wait_for_layer_cfg_done(struct vop2 *vop2, u32 cfg)
 			      atv_layer_cfg, cfg);
 }
 
+/*
+ * Video ports phase-locked by rockchip,sync-vp-mask reach their frame start
+ * together. Below this distance to that edge the read | write of
+ * REG_CFG_DONE (a few register accesses with interrupts off) could still
+ * race the other port's frame start; above it, it cannot.
+ */
+#define VOP2_SYNC_VP_CFG_DONE_GUARD_US	200
+
+static bool vop2_sync_vp_pair(struct vop2 *vop2, u32 vp_a, u32 vp_b)
+{
+	u32 pair = BIT(vp_a) | BIT(vp_b);
+
+	return (vop2->sync_vp_mask & pair) == pair;
+}
+
 static int32_t vop2_pending_done_bits(struct vop2_video_port *vp)
 {
 	struct vop2 *vop2 = vp->vop2;
@@ -2115,6 +2130,7 @@ static int32_t vop2_pending_done_bits(struct vop2_video_port *vp)
 	uint32_t done_bits, done_bits_bak;
 	uint32_t vp_id;
 	uint32_t vcnt;
+	bool wait_edge;
 
 	done_bits = vop2_readl(vop2, RK3568_REG_CFG_DONE) & 0x7;
 	done_bits_bak = done_bits;
@@ -2141,7 +2157,22 @@ static int32_t vop2_pending_done_bits(struct vop2_video_port *vp)
 		if (adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE)
 			vcnt >>= 1;
 		/* if close to the last 1/8 frame, wait to next frame */
-		if (vcnt > (adjusted_mode->crtc_vtotal * 7 >> 3)) {
+		wait_edge = vcnt > (adjusted_mode->crtc_vtotal * 7 >> 3);
+		/*
+		 * For a phase-locked pair the edge of done_vp is also the edge of
+		 * this port: waiting for it makes this port miss it, so a commit
+		 * for both ports lands the second one a whole frame after the
+		 * first. On the atomic_flush path (interrupts off) keep both bits
+		 * on the same edge unless it is closer than the guard.
+		 */
+		if (wait_edge && irqs_disabled() &&
+		    !(adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE) &&
+		    vop2_sync_vp_pair(vop2, vp->id, vp_id) &&
+		    vcnt < adjusted_mode->crtc_vtotal &&
+		    vop2_line_to_time(adjusted_mode, adjusted_mode->crtc_vtotal - vcnt) >
+		    VOP2_SYNC_VP_CFG_DONE_GUARD_US)
+			wait_edge = false;
+		if (wait_edge) {
 			vop2_wait_for_fs_by_done_bit_status(done_vp);
 			done_bits = 0;
 		}
