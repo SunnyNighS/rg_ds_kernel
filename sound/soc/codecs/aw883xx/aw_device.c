@@ -792,10 +792,18 @@ static int aw_dev_sysint_check(struct aw_device *aw_dev)
 	int ret = 0;
 	uint16_t reg_val = 0;
 	struct aw_int_desc *desc = &aw_dev->int_desc;
+	unsigned int mask = desc->intst_mask;
 
 	aw_dev_get_int_status(aw_dev, &reg_val);
 
-	if (reg_val & (desc->intst_mask)) {
+	/*
+	 * After a stream close the CPU DAI has already stopped BCLK/LRCK, so
+	 * CLKI/NOCLKI are expected there and are no sign of a DSP fault.
+	 */
+	if (aw_dev->stop_after_close)
+		mask &= ~desc->clk_lost_mask;
+
+	if (reg_val & mask) {
 		aw_dev_err(aw_dev->dev, "pa stop check fail:0x%04x", reg_val);
 		ret = -EINVAL;
 	}

@@ -141,6 +141,7 @@ struct aw_int_desc {
 	unsigned int mask_default;		/*default mask close all*/
 	unsigned int int_mask;			/*set mask*/
 	unsigned int intst_mask;		/*interrupt check mask*/
+	unsigned int clk_lost_mask;		/*clock-loss bits within intst_mask*/
 	uint16_t sysint_st;			/*interrupt reg status*/
 };
 
@@ -438,6 +439,7 @@ struct aw_device {
 	void *private_data;
 
 	uint32_t fade_en;
+	bool stop_after_close;	/*stop runs after the CPU DAI stopped BCLK/LRCK*/
 	unsigned char dsp_cfg;
 
 	uint32_t dsp_fw_len;

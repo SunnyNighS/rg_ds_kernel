@@ -739,10 +739,11 @@ static void aw883xx_start(struct aw883xx *aw883xx, bool sync_start)
 
 /*
  * The CPU DAI has already stopped BCLK/LRCK when ASoC mutes us in
- * hw_free, so aw_device_stop() always sees CLKI/PLLI in SYSINT and
- * reloads the DSP firmware and config (~300 ms per amp on the 200 kHz
- * bus). Run that stop here, off the PCM close path, so audio HAL
- * standby does not block for ~0.6 s.
+ * hw_free, so SYSINT always shows CLKI/NOCLKI here. That is expected
+ * and must not trigger the DSP firmware and config reload (~300 ms per
+ * amp on the 200 kHz bus), which made the next stream's prepare wait in
+ * flush_work(). A real DSP fault is still caught by the checks in
+ * aw_device_start(), which reload the firmware and retry.
  */
 static void aw883xx_stop_work(struct work_struct *work)
 {
@@ -750,8 +751,11 @@ static void aw883xx_stop_work(struct work_struct *work)
 		container_of(work, struct aw883xx, stop_work);
 
 	mutex_lock(&aw883xx->lock);
-	if (aw883xx->pstream == AW883XX_STREAM_CLOSE)
+	if (aw883xx->pstream == AW883XX_STREAM_CLOSE) {
+		aw883xx->aw_pa->stop_after_close = true;
 		aw_device_stop(aw883xx->aw_pa);
+		aw883xx->aw_pa->stop_after_close = false;
+	}
 	mutex_unlock(&aw883xx->lock);
 }
 

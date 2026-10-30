@@ -474,6 +474,8 @@ static int aw883xx_dev_init(struct aw883xx *aw883xx)
 	aw_pa->int_desc.int_mask = AW_PID_2049_SYSINTM_DEFAULT;
 	aw_pa->int_desc.st_reg = AW_PID_2049_SYSINT_REG;
 	aw_pa->int_desc.intst_mask = AW_PID_2049_BIT_SYSINT_CHECK;
+	aw_pa->int_desc.clk_lost_mask = AW_PID_2049_CLKI_INTERRUPT |
+					AW_PID_2049_NOCLKI_INTERRUPT;
 
 	aw_pa->pwd_desc.reg = AW_PID_2049_SYSCTRL_REG;
 	aw_pa->pwd_desc.mask = AW_PID_2049_PWDN_MASK;
