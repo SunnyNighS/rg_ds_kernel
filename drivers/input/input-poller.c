@@ -7,6 +7,7 @@
 #include <linux/input.h>
 #include <linux/jiffies.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
@@ -23,6 +24,16 @@ struct input_dev_poller {
 	struct delayed_work work;
 };
 
+/*
+ * RG DS Plus: the emulators run SCHED_FIFO threads on all CPUs. A poll work
+ * on the per-CPU system_freezable_wq stays on the CPU its timer fired on and
+ * waits there until the FIFO thread sleeps: the joypad poll (8 ms interval)
+ * started up to 12 ms late. An unbound queue lets the poll run on whichever
+ * CPU is free. NULL elsewhere (and if the allocation fails), which keeps
+ * system_freezable_wq.
+ */
+static struct workqueue_struct *input_poller_wq;
+
 static void input_dev_poller_queue_work(struct input_dev_poller *poller)
 {
 	unsigned long delay;
@@ -31,7 +42,8 @@ static void input_dev_poller_queue_work(struct input_dev_poller *poller)
 	if (delay >= HZ)
 		delay = round_jiffies_relative(delay);
 
-	queue_delayed_work(system_freezable_wq, &poller->work, delay);
+	queue_delayed_work(READ_ONCE(input_poller_wq) ?: system_freezable_wq,
+			   &poller->work, delay);
 }
 
 static void input_dev_poller_work(struct work_struct *work)
@@ -69,6 +81,16 @@ int input_setup_polling(struct input_dev *dev,
 			void (*poll_fn)(struct input_dev *dev))
 {
 	struct input_dev_poller *poller;
+
+	if (!READ_ONCE(input_poller_wq) &&
+	    of_machine_is_compatible("anbernic,rg-ds-plus")) {
+		struct workqueue_struct *wq;
+
+		wq = alloc_workqueue("input_poller",
+				     WQ_FREEZABLE | WQ_UNBOUND | WQ_HIGHPRI, 0);
+		if (wq && cmpxchg(&input_poller_wq, NULL, wq))
+			destroy_workqueue(wq);
+	}
 
 	poller = kzalloc(sizeof(*poller), GFP_KERNEL);
 	if (!poller) {
