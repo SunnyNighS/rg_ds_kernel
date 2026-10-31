@@ -1447,6 +1447,133 @@ static uint64_t vop2_soc_id_fixup(uint64_t soc_id)
 	}
 }
 
+/*
+ * rockchip,sync-vp-mask phase-aligns the scanout of two video ports. The stock way to do that,
+ * vop2_crtc_sync(), puts every masked port into standby and releases them together. On rk3568
+ * that is the wrong thing to do: the "standby reached" flag it polls (edpi_wms_fs) does not exist,
+ * so it always runs its whole poll timeout, and every port it halts is already driving a streaming
+ * DSI link, the other panel's and, because the DSI bridge releases its port before
+ * crtc_post_enable, its own. Stopping and restarting the DPI stream under an enabled DW-MIPI-DSI
+ * host left a panel with a constant horizontal offset (the whole image shifted by about 100
+ * pixels, wrapping around) that only a DSI power cycle cleared.
+ *
+ * So a port without that flag is aligned at the one point the stock driver already treats as safe
+ * to start its stream: the release from standby by the DSI bridge, after the host was reset and
+ * switched to video mode. The port is released on the frame start of the other port that is
+ * scanning, and that other port is never touched. The bridge halted the new port at a frame end
+ * and its first pixels go into the empty FIFO of a freshly reset host, as in the stock flow.
+ */
+#define VOP2_SYNC_VP_ALIGN_LINES	6
+#define VOP2_SYNC_VP_ALIGN_SPIN_US	200
+#define VOP2_SYNC_VP_ALIGN_WAIT_US	40000
+
+static bool vop2_sync_by_release(struct vop2 *vop2)
+{
+	struct vop2_video_port *vp;
+
+	if (!vop2->sync_vp_mask)
+		return false;
+
+	vp = &vop2->vps[__ffs(vop2->sync_vp_mask)];
+
+	return vp->regs && !vp->regs->edpi_wms_fs.mask;
+}
+
+/* The counter can be read in the middle of a carry, so take two reads that agree within a line. */
+static bool vop2_sync_vcnt_sample(struct vop2_video_port *vp, u32 *vcnt)
+{
+	struct vop2 *vop2 = vp->vop2;
+	u32 first = VOP_MODULE_GET(vop2, vp, dsp_vcnt);
+	u32 second = VOP_MODULE_GET(vop2, vp, dsp_vcnt);
+
+	*vcnt = second;
+
+	return second - first <= 1;
+}
+
+static void vop2_crtc_release_standby_aligned(struct vop2_video_port *vp)
+{
+	struct vop2 *vop2 = vp->vop2;
+	struct vop2_video_port *ref = NULL;
+	unsigned long others = vop2->sync_vp_mask & vop2->active_vp_mask & ~BIT(vp->id);
+	unsigned long flags;
+	bool released = false;
+	bool aligned = false;
+	ktime_t deadline;
+	ktime_t spin_end;
+	u32 vtotal = 0;
+	u32 vcnt = 0;
+	u32 ref_vcnt = 0;
+	int vp_id;
+
+	for_each_set_bit(vp_id, &others, ROCKCHIP_MAX_CRTC) {
+		struct vop2_video_port *other = &vop2->vps[vp_id];
+
+		if (!VOP_MODULE_GET(vop2, other, standby)) {
+			ref = other;
+			break;
+		}
+	}
+
+	if (ref)
+		vtotal = VOP_MODULE_GET(vop2, ref, dsp_vtotal);
+
+	/* No port is scanning yet: this one is first and the other aligns to it when it comes up. */
+	if (vtotal <= 2 * VOP2_SYNC_VP_ALIGN_LINES) {
+		VOP_MODULE_SET(vop2, vp, standby, 0);
+		return;
+	}
+
+	/*
+	 * Wait with interrupts on until the scanning port is a few lines before its frame start, then
+	 * take the lock and look again, as the window is only about 125 us wide and anything may have
+	 * run in between. Only the last few lines are spent with interrupts off.
+	 */
+	deadline = ktime_add_us(ktime_get(), VOP2_SYNC_VP_ALIGN_WAIT_US);
+
+	while (ktime_before(ktime_get(), deadline)) {
+		if (!vop2_sync_vcnt_sample(ref, &vcnt) ||
+		    vcnt + VOP2_SYNC_VP_ALIGN_LINES < vtotal) {
+			udelay(10);
+			continue;
+		}
+
+		spin_lock_irqsave(&vop2->reg_lock, flags);
+
+		if (vop2_sync_vcnt_sample(ref, &vcnt) &&
+		    vcnt + VOP2_SYNC_VP_ALIGN_LINES >= vtotal) {
+			spin_end = ktime_add_us(ktime_get(), VOP2_SYNC_VP_ALIGN_SPIN_US);
+
+			do {
+				aligned = VOP_MODULE_GET(vop2, ref, dsp_vcnt) <
+					  VOP2_SYNC_VP_ALIGN_LINES;
+			} while (!aligned && ktime_before(ktime_get(), spin_end));
+
+			VOP_MODULE_SET(vop2, vp, standby, 0);
+			released = true;
+		}
+
+		spin_unlock_irqrestore(&vop2->reg_lock, flags);
+
+		if (released)
+			break;
+	}
+
+	/* Losing the alignment is safe for both links, being stuck is not. */
+	if (!released)
+		VOP_MODULE_SET(vop2, vp, standby, 0);
+
+	vop2_sync_vcnt_sample(vp, &vcnt);
+	vop2_sync_vcnt_sample(ref, &ref_vcnt);
+
+	if (aligned)
+		DRM_DEV_INFO(vop2->dev, "vp%d released from standby on the frame start of vp%d (vcnt %u/%u)\n",
+			     vp->id, ref->id, vcnt, ref_vcnt);
+	else
+		DRM_DEV_INFO(vop2->dev, "vp%d released from standby without alignment to vp%d (vcnt %u/%u)\n",
+			     vp->id, ref->id, vcnt, ref_vcnt);
+}
+
 static void vop2_crtc_standby(struct drm_crtc *crtc, bool standby)
 {
 	struct vop2_video_port *vp = to_vop2_video_port(crtc);
@@ -1455,6 +1582,13 @@ static void vop2_crtc_standby(struct drm_crtc *crtc, bool standby)
 	if (standby) {
 		VOP_MODULE_SET(vop2, vp, standby, 1);
 		mdelay(20);
+	} else if (vop2_sync_by_release(vop2) && (vop2->sync_vp_mask & BIT(vp->id)) &&
+		   crtc->state && crtc->state->active && VOP_MODULE_GET(vop2, vp, standby)) {
+		/*
+		 * The release in post_disable of a port that is going off has no stream to
+		 * protect and, with the state already inactive, takes the plain write.
+		 */
+		vop2_crtc_release_standby_aligned(vp);
 	} else {
 		VOP_MODULE_SET(vop2, vp, standby, 0);
 	}
@@ -1543,7 +1677,11 @@ static void vop2_crtc_output_post_enable(struct drm_crtc *crtc, int intf)
 	if (!vp->loader_protect)
 		vop2_clk_reset(vp->dclk_rst);
 
-	if (vop2->sync_vp_mask) {
+	/*
+	 * A port aligned by its standby release (vop2_crtc_standby) must not be halted again
+	 * here: the DSI bridge has already released it and the link is streaming.
+	 */
+	if (vop2->sync_vp_mask && !vop2_sync_by_release(vop2)) {
 		if ((vop2->active_vp_mask & vop2->sync_vp_mask) == vop2->sync_vp_mask)
 			vop2_crtc_sync(crtc, vop2->sync_vp_mask);
 	}
@@ -1965,10 +2103,16 @@ static int vop2_crtc_sync(struct drm_crtc *crtc, unsigned long crtc_mask);
  * vop2_crtc_sync() - never runs, so the two video ports free-run phase-offset
  * from each other (measured ~99 scanlines apart on the dual-screen RG DS).
  * Once both sync_vp_mask ports are active, fire vop2_crtc_sync() once to align
- * their scanout (verified to drive the inter-VP delta to 0 and hold). Gated by
- * sync_vp_mask, which only the dual-DSI RG DS device tree sets, so this is a
- * no-op on every other board. Bounded poll so it gives up if the second port
- * never comes up.
+ * their scanout. Gated by sync_vp_mask, which only the dual-DSI RG DS device
+ * tree sets, so this is a no-op on every other board. Bounded poll so it gives
+ * up if the second port never comes up.
+ *
+ * Not for ports that vop2_sync_by_release() aligns (rk3568): both links are
+ * streaming here, so vop2_crtc_sync() would halt and restart both of them, and
+ * the DSI host or the panel can be left with a constant horizontal offset
+ * that only a DSI power cycle clears. They stay as they are, the first modeset
+ * of each port aligns it (the userspace composer power-cycles the panels at
+ * boot and on every wake), and only the scanout lines are logged.
  */
 static void vop2_boot_sync_fn(struct work_struct *work)
 {
@@ -1983,6 +2127,17 @@ static void vop2_boot_sync_fn(struct work_struct *work)
 	if ((vop2->active_vp_mask & vop2->sync_vp_mask) == vop2->sync_vp_mask &&
 	    pm_runtime_get_if_in_use(vop2->dev) > 0) {
 		int vp0 = __ffs(vop2->sync_vp_mask);
+
+		if (vop2_sync_by_release(vop2)) {
+			int vp1 = __fls(vop2->sync_vp_mask);
+
+			pr_info("vop2: dual-VP scanout inherited from the loader, vp%d vcnt %u vp%d vcnt %u, left running\n",
+				vp0, vop2_read_vcnt(&vop2->vps[vp0]),
+				vp1, vop2_read_vcnt(&vop2->vps[vp1]));
+			vop2->boot_sync_done = true;
+			pm_runtime_put(vop2->dev);
+			return;
+		}
 
 		vop2_crtc_sync(&vop2->vps[vp0].rockchip_crtc.crtc, vop2->sync_vp_mask);
 		vop2->boot_sync_done = true;
