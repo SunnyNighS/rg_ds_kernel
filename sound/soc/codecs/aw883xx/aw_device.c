@@ -1415,6 +1415,7 @@ int aw_device_start(struct aw_device *aw_dev)
 	if (ret < 0) {
 		aw_dev_err(aw_dev->dev, "pll check failed cannot start");
 		aw_dev_reg_dump(aw_dev);
+		ret = -EAGAIN;	/* no I2S clock (PLL unlocked): the DSP firmware is not at fault */
 		goto pll_check_fail;
 	}
 

@@ -677,7 +677,16 @@ static void aw883xx_start_pa(struct aw883xx *aw883xx)
 	}
 
 	for (i = 0; i < AW_START_RETRIES; i++) {
+		/* The stream was closed meanwhile (suspend, HAL standby): stop. */
+		if (aw883xx->pstream == AW883XX_STREAM_CLOSE)
+			break;
 		ret = aw_device_start(aw883xx->aw_pa);
+		if (ret == -EAGAIN) {
+			/* No BCLK yet: a firmware reload cannot help, retry shortly. */
+			aw_dev_err(aw883xx->dev, "start failed, no i2s clock");
+			usleep_range(10000, 11000);
+			continue;
+		}
 		if (ret) {
 			aw_dev_err(aw883xx->dev, "start failed");
 			ret = aw_dev_fw_update(aw883xx->aw_pa, AW_DSP_FW_UPDATE_ON, true);
