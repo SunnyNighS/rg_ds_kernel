@@ -1846,6 +1846,10 @@ EXTRA_CFLAGS += -DCONFIG_CONCURRENT_MODE
 # without this rtw_set_country() is stubbed and cfg80211 stays at world "00"
 # (TX floored to -100 dBm, 5G passive), so wlan0 scans but never associates.
 EXTRA_CFLAGS += -DCONFIG_RTW_IOCTL_SET_COUNTRY
+# Resume from rtw_workqueue instead of the SDIO resume callback, so the ~1 s firmware reload no longer
+# holds up the kernel resume and the userspace thaw. drv_conf.h requires CONFIG_WAKELOCK with it
+# (linux/wakelock.h shim): the "rtw_wifi_resume" wakeup source then blocks autosuspend until it is done.
+EXTRA_CFLAGS += -DCONFIG_RESUME_IN_WORKQUEUE -DCONFIG_WAKELOCK
 ARCH := arm64
 CROSS_COMPILE := /usr/local/toolchain/arm-gnu-toolchain-13.3.rel1-aarch64-aarch64-none-elf/bin/aarch64-none-elf-
 KSRC := /usr/lib/modules/*.*.*-ophub/build

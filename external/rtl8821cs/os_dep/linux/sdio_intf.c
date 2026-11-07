@@ -132,6 +132,13 @@ static int rtw_sdio_resume(struct device *dev);
 static int rtw_sdio_suspend(struct device *dev);
 extern void rtw_dev_unload(PADAPTER padapter);
 
+#ifdef CONFIG_RESUME_IN_WORKQUEUE
+/* 1: resume from rtw_workqueue, so the kernel resume does not wait for the firmware reload */
+static int rtw_resume_async = 1;
+module_param(rtw_resume_async, int, 0644);
+MODULE_PARM_DESC(rtw_resume_async, "Resume from the driver workqueue (1) or in the resume callback (0)");
+#endif
+
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 29))
 static const struct dev_pm_ops rtw_sdio_pm_ops = {
 	.suspend	= rtw_sdio_suspend,
@@ -1196,7 +1203,10 @@ static void rtw_dev_remove(struct sdio_func *func)
 	struct pwrctrl_priv *pwrctl = dvobj_to_pwrctl(dvobj);
 	PADAPTER padapter = dvobj_get_primary_adapter(dvobj);
 
-
+#ifdef CONFIG_RESUME_IN_WORKQUEUE
+	/* A resume still running from rtw_workqueue must finish before the netdevs go away. */
+	flush_work(&pwrctl->resume_work);
+#endif
 
 	dvobj->processing_dev_remove = _TRUE;
 
@@ -1298,6 +1308,12 @@ static int rtw_sdio_suspend(struct device *dev)
 	pwrpriv = dvobj_to_pwrctl(psdpriv);
 	padapter = dvobj_get_primary_adapter(psdpriv);
 	pdbgpriv = &psdpriv->drv_dbg;
+
+#ifdef CONFIG_RESUME_IN_WORKQUEUE
+	/* A resume still running from rtw_workqueue must finish while the SDIO host is up. */
+	flush_work(&pwrpriv->resume_work);
+#endif
+
 	if (rtw_is_drv_stopped(padapter)) {
 		RTW_INFO("%s bDriverStopped == _TRUE\n", __func__);
 		goto exit;
@@ -1375,22 +1391,29 @@ static int rtw_sdio_resume(struct device *dev)
 		rtw_resume_unlock_suspend();
 	} else {
 #ifdef CONFIG_RESUME_IN_WORKQUEUE
-		rtw_resume_in_workqueue(pwrpriv);
-#else
-		/* Realtek defers the resume to the early-suspend late_resume hook when one
-		 * is registered ("do it after the screen is lit"). On the Rockchip kernels
-		 * (CONFIG_ROCKCHIP_EARLYSUSPEND) late_resume fires from the /sys/power/state
-		 * write path BEFORE the SDIO device resume callbacks run, so do_late_resume is
-		 * still false when it fires and the deferred resume never happens: the netdev
-		 * stays down with bInSuspend=1 ("netdev_open failed, bInSuspend=1" on every
-		 * later open), scans fail, and Wi-Fi is dead until a reboot. Seen on the
-		 * RG DS Plus after the ultra low power sleep (sleep.sh writes mem directly).
-		 * Resume right here, in the device resume callback, like every other bus. */
-		rtw_set_do_late_resume(pwrpriv, _FALSE);
-		rtw_resume_lock_suspend();
-		ret = rtw_resume_process(padapter);
-		rtw_resume_unlock_suspend();
+		if (rtw_resume_async) {
+			/* The firmware reload (~1 s) runs from rtw_workqueue. The wakeup source
+			 * "rtw_wifi_resume" is held until it is done, and rtw_sdio_suspend and
+			 * rtw_dev_remove flush it. rtw_pwr_wakeup waits for bInSuspend. */
+			rtw_set_do_late_resume(pwrpriv, _FALSE);
+			rtw_resume_in_workqueue(pwrpriv);
+		} else
 #endif
+		{
+			/* Realtek defers the resume to the early-suspend late_resume hook when one
+			 * is registered ("do it after the screen is lit"). On the Rockchip kernels
+			 * (CONFIG_ROCKCHIP_EARLYSUSPEND) late_resume fires from the /sys/power/state
+			 * write path BEFORE the SDIO device resume callbacks run, so do_late_resume is
+			 * still false when it fires and the deferred resume never happens: the netdev
+			 * stays down with bInSuspend=1 ("netdev_open failed, bInSuspend=1" on every
+			 * later open), scans fail, and Wi-Fi is dead until a reboot. Seen on the
+			 * RG DS Plus after the ultra low power sleep (sleep.sh writes mem directly).
+			 * Resume right here, in the device resume callback, like every other bus. */
+			rtw_set_do_late_resume(pwrpriv, _FALSE);
+			rtw_resume_lock_suspend();
+			ret = rtw_resume_process(padapter);
+			rtw_resume_unlock_suspend();
+		}
 	}
 	pmlmeext->last_scan_time = rtw_get_current_time();
 	RTW_INFO("<========  %s return %d\n", __FUNCTION__, ret);
