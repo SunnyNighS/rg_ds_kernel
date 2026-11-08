@@ -1614,6 +1614,35 @@ static int joypad_probe(struct platform_device *pdev)
 }
 
 /*----------------------------------------------------------------------------*/
+/* The input core releases every held key at suspend (input_dev_release_keys) and nothing re-reports it at resume:
+ * gpio_check only emits on a change against old_value, so a button held through the suspend read as released until
+ * it was pressed again (Select+Vol turned into volume after a wake). Forget the key levels so the next poll reports
+ * what is held. Hat directions (EV_ABS) are left alone: the core never released them, and resetting them would send
+ * a stale direction. */
+static int joypad_resume(struct device *dev)
+{
+	struct joypad *joypad = dev_get_drvdata(dev);
+	int nbtn, rearmed = 0;
+
+	if (!joypad)
+		return 0;
+	mutex_lock(&joypad->lock);
+	for (nbtn = 0; nbtn < joypad->bt_gpio_count; nbtn++) {
+		struct bt_gpio *gpio = &joypad->gpios[nbtn];
+
+		if (gpio->report_type != EV_KEY)
+			continue;
+		gpio->old_value = gpio->active_level ? 0 : 1;
+		rearmed++;
+	}
+	mutex_unlock(&joypad->lock);
+	dev_info(dev, "resume: %d key(s) re-read on the next poll\n", rearmed);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(joypad_pm_ops, NULL, joypad_resume);
+
+/*----------------------------------------------------------------------------*/
 static const struct of_device_id joypad_of_match[] = {
 	{ .compatible = "singleadc-joypad", },
 	{},
@@ -1627,6 +1656,7 @@ static struct platform_driver joypad_driver = {
 	.driver = {
 		.name = DRV_NAME,
 		.of_match_table = of_match_ptr(joypad_of_match),
+		.pm = pm_sleep_ptr(&joypad_pm_ops),
 	},
 };
 
